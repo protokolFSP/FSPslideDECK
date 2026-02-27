@@ -30,19 +30,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y libreoffice
-
       - name: Install notebooklm-mcp-cli
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install notebooklm-mcp-cli
+          python -m pip install notebooklm-mcp-cli
+          nlm --help >/dev/null
 
       - name: Generate decks (PPTX + PDF)
         shell: bash
@@ -59,31 +53,32 @@ jobs:
           BRANCH="deck-archive"
           ARCH_DIR=".worktree-deck-archive"
 
-          # Clean any previous worktree leftovers
           rm -rf "$ARCH_DIR" || true
-
           git fetch origin || true
 
           if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
             git worktree add "$ARCH_DIR" "$BRANCH"
           else
-            # Create orphan branch in a new worktree
             git worktree add --detach "$ARCH_DIR"
             pushd "$ARCH_DIR" >/dev/null
             git checkout --orphan "$BRANCH"
-            # Remove all files from the orphan checkout
             git rm -rf . >/dev/null 2>&1 || true
             popd >/dev/null
           fi
 
-          # Copy artifacts
           mkdir -p "$ARCH_DIR/decks" "$ARCH_DIR/decks_pdf" "$ARCH_DIR/manifest"
-          rsync -a --delete --exclude=".gitkeep" "decks/" "$ARCH_DIR/decks/" || true
-          rsync -a --delete --exclude=".gitkeep" "decks_pdf/" "$ARCH_DIR/decks_pdf/" || true
-          rsync -a "manifest/" "$ARCH_DIR/manifest/" || true
+
+          if command -v rsync >/dev/null 2>&1; then
+            rsync -a "decks/" "$ARCH_DIR/decks/" || true
+            rsync -a "decks_pdf/" "$ARCH_DIR/decks_pdf/" || true
+            rsync -a "manifest/" "$ARCH_DIR/manifest/" || true
+          else
+            cp -R "decks/." "$ARCH_DIR/decks/" || true
+            cp -R "decks_pdf/." "$ARCH_DIR/decks_pdf/" || true
+            cp -R "manifest/." "$ARCH_DIR/manifest/" || true
+          fi
 
           pushd "$ARCH_DIR" >/dev/null
-
           git add -A
 
           if git diff --cached --quiet; then
@@ -94,7 +89,6 @@ jobs:
             git commit -m "Archive decks: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             git push -u origin "$BRANCH"
           fi
-
           popd >/dev/null
 
           git worktree remove "$ARCH_DIR" --force
