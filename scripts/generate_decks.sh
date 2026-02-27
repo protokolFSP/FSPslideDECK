@@ -142,10 +142,10 @@ Erstelle ein Slide-Deck auf Deutsch basierend AUSSCHLIESSLICH auf dem bereitgest
 
 Vorgaben:
 - Sprache: Deutsch
-- Umfang: 10–12 Folien
+- Umfang: 14–15 Folien
 - Zielgruppe: Management / Fachpublikum
 - Stil: klar, prägnant, entscheidungsorientiert
-- Jede Folie: Titel + 3–5 Bulletpoints, max. 12 Wörter pro Bulletpoint
+- Jede Folie: Titel + 3–5 Bulletpoints, 
 - Zahlen, Eigennamen und Datumsangaben: exakt übernehmen
 - Keine erfundenen Fakten, keine klinischen/realen Details hinzufügen, die nicht im Transkript stehen
 - Wenn der Sprecher unklar ist: “Sprecher 1”, “Sprecher 2” verwenden
