@@ -1,0 +1,108 @@
+name: Build decks and upload PDFs to Archive.org
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_per_run:
+        description: "Maximum transcripts to process this run"
+        required: false
+        default: "15"
+  schedule:
+    - cron: "17 2 * * *" # daily 02:17 UTC
+
+jobs:
+  build-and-upload:
+    runs-on: self-hosted
+    permissions:
+      contents: write
+
+    env:
+      MAX_PER_RUN: ${{ github.event.inputs.max_per_run || '15' }}
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libreoffice
+
+      - name: Install notebooklm-mcp-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install notebooklm-mcp-cli
+
+      - name: Generate decks (PPTX + PDF)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/generate_decks.sh
+          scripts/generate_decks.sh
+
+      - name: Publish outputs to deck-archive branch (git worktree)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BRANCH="deck-archive"
+          ARCH_DIR=".worktree-deck-archive"
+
+          # Clean any previous worktree leftovers
+          rm -rf "$ARCH_DIR" || true
+
+          git fetch origin || true
+
+          if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
+            git worktree add "$ARCH_DIR" "$BRANCH"
+          else
+            # Create orphan branch in a new worktree
+            git worktree add --detach "$ARCH_DIR"
+            pushd "$ARCH_DIR" >/dev/null
+            git checkout --orphan "$BRANCH"
+            # Remove all files from the orphan checkout
+            git rm -rf . >/dev/null 2>&1 || true
+            popd >/dev/null
+          fi
+
+          # Copy artifacts
+          mkdir -p "$ARCH_DIR/decks" "$ARCH_DIR/decks_pdf" "$ARCH_DIR/manifest"
+          rsync -a --delete --exclude=".gitkeep" "decks/" "$ARCH_DIR/decks/" || true
+          rsync -a --delete --exclude=".gitkeep" "decks_pdf/" "$ARCH_DIR/decks_pdf/" || true
+          rsync -a "manifest/" "$ARCH_DIR/manifest/" || true
+
+          pushd "$ARCH_DIR" >/dev/null
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "Archive decks: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            git push -u origin "$BRANCH"
+          fi
+
+          popd >/dev/null
+
+          git worktree remove "$ARCH_DIR" --force
+
+      - name: Upload PDFs to Archive.org (FSPslide)
+        uses: Nick2bad4u/internet-archive-upload@v3
+        with:
+          access-key: ${{ secrets.IA_ACCESS_KEY }}
+          secret-key: ${{ secrets.IA_SECRET_KEY }}
+          identifier: FSPslide
+          files: decks_pdf
