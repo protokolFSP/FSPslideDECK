@@ -2,8 +2,13 @@
 set -euo pipefail
 
 # scripts/generate_decks.sh
-# Generates PPTX + PDF slide decks from TXT transcripts using notebooklm-mcp-cli.
-# Idempotent: skips if outputs already exist.
+#
+# Generates PPTX + PDF slide decks from TXT transcripts using notebooklm-mcp-cli (nlm).
+# - Source transcripts: cloned from a separate repo (TXT only).
+# - One deck per transcript file.
+# - Output: decks/<name>.pptx and decks_pdf/<name>.pdf
+# - Idempotent: if both outputs exist, it skips.
+# - Best-effort: failures do not stop the whole run; logs to manifest.
 #
 # Env vars:
 #   MAX_PER_RUN (default: 15)
@@ -15,11 +20,6 @@ set -euo pipefail
 #   MANIFEST_PATH (default: manifest/manifest.csv)
 #   NLM_NOTEBOOK_ALIAS (default: deckfactory)
 #   NLM_NOTEBOOK_NAME (default: Deck Factory)
-#
-# Requirements on runner:
-#   - notebooklm-mcp-cli installed and logged in (nlm login)
-#   - libreoffice (soffice) installed
-#   - git
 
 MAX_PER_RUN="${MAX_PER_RUN:-15}"
 TRANSCRIPT_REPO="${TRANSCRIPT_REPO:-https://github.com/protokolFSP/FSPtranskript}"
@@ -47,13 +47,18 @@ ensure_dirs() {
 }
 
 append_manifest() {
-  # args: transcript_relpath, deck_name, status, pptx_path, pdf_path, message
-  # CSV is simple; escape double quotes.
   local ts rel name status pptx pdf msg
   ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   rel="$1"; name="$2"; status="$3"; pptx="$4"; pdf="$5"; msg="$6"
   msg="${msg//\"/\"\"}"
   printf '%s,"%s","%s","%s","%s","%s","%s"\n' "$ts" "$rel" "$name" "$status" "$pptx" "$pdf" "$msg" >> "$MANIFEST_PATH"
+}
+
+check_dependencies() {
+  command -v nlm >/dev/null 2>&1 || { err "nlm not found. Install on runner (workflow installs it), and run 'nlm login' once on the runner machine."; exit 1; }
+  command -v git >/dev/null 2>&1 || { err "git not found."; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { err "python3 not found."; exit 1; }
+  command -v rsync >/dev/null 2>&1 || true
 }
 
 clone_or_pull_transcripts() {
@@ -73,59 +78,27 @@ clone_or_pull_transcripts() {
   fi
 }
 
-check_dependencies() {
-  command -v nlm >/dev/null 2>&1 || { err "nlm not found. Install: pip install notebooklm-mcp-cli"; exit 1; }
-  command -v soffice >/dev/null 2>&1 || command -v libreoffice >/dev/null 2>&1 || { err "LibreOffice (soffice) not found."; exit 1; }
-  command -v git >/dev/null 2>&1 || { err "git not found."; exit 1; }
-  command -v python3 >/dev/null 2>&1 || { err "python3 not found."; exit 1; }
-}
-
 nlm_login_check() {
   log "Checking NotebookLM login state..."
   if ! nlm login --check >/dev/null 2>&1; then
-    err "NotebookLM login missing. Run 'nlm login' on the self-hosted runner once."
+    err "NotebookLM login missing. Run 'nlm login' ONCE on the self-hosted runner machine (same user)."
     exit 2
   fi
   log "NotebookLM login OK."
 }
 
-python_json_get() {
-  # Reads JSON from stdin and prints a field expression.
-  # usage: python_json_get 'data["id"]'
-  local expr="$1"
-  python3 -c "import sys, json; data=json.load(sys.stdin); print($expr)"
-}
-
 ensure_deckfactory_notebook() {
   log "Ensuring notebook exists (alias: $NLM_NOTEBOOK_ALIAS, name: $NLM_NOTEBOOK_NAME)"
-  # If alias exists, this should succeed; otherwise create it.
-  if nlm notebook list --json 2>/dev/null | python3 - <<'PY' >/dev/null 2>&1
-import sys, json
-data=json.load(sys.stdin)
-alias="deckfactory"
-items=data if isinstance(data, list) else data.get("items") or data.get("notebooks") or []
-found=False
-for it in items:
-  if (it.get("alias") or "") == alias:
-    found=True
-    break
-print("1" if found else "0")
-PY
-  then
-    # Above script returns 0/1 but we didn't capture; do a safer check:
-    :
-  fi
-
-  # Explicitly determine presence:
   local exists
   exists="$(nlm notebook list --json 2>/dev/null | python3 - <<PY
 import sys, json
 data=json.load(sys.stdin)
 alias="${NLM_NOTEBOOK_ALIAS}"
-items=data if isinstance(data, list) else data.get("items") or data.get("notebooks") or []
-print("yes" if any((it.get("alias") or "")==alias for it in items) else "no")
+items=data if isinstance(data, list) else (data.get("items") or data.get("notebooks") or [])
+print("yes" if any((it.get("alias") or "")==alias for it in items if isinstance(it, dict)) else "no")
 PY
-)"
+)" || exists="no"
+
   if [ "$exists" = "yes" ]; then
     log "Notebook alias '$NLM_NOTEBOOK_ALIAS' already exists."
     return 0
@@ -142,10 +115,10 @@ Erstelle ein Slide-Deck auf Deutsch basierend AUSSCHLIESSLICH auf dem bereitgest
 
 Vorgaben:
 - Sprache: Deutsch
-- Umfang: 14–15 Folien
+- Umfang: 10–12 Folien
 - Zielgruppe: Management / Fachpublikum
 - Stil: klar, prägnant, entscheidungsorientiert
-- Jede Folie: Titel + 3–5 Bulletpoints, 
+- Jede Folie: Titel + 3–5 Bulletpoints, max. 12 Wörter pro Bulletpoint
 - Zahlen, Eigennamen und Datumsangaben: exakt übernehmen
 - Keine erfundenen Fakten, keine klinischen/realen Details hinzufügen, die nicht im Transkript stehen
 - Wenn der Sprecher unklar ist: “Sprecher 1”, “Sprecher 2” verwenden
@@ -168,55 +141,42 @@ Letzte Folie: “Nächste Schritte” als Checkliste mit:
 PROMPT
 }
 
-safe_filename() {
-  # Keep original base name; ensure no path traversal.
-  # args: path -> prints basename without extension
+safe_basename_noext() {
   local p="$1"
   local b
   b="$(basename "$p")"
   printf '%s' "${b%.txt}"
 }
 
-pptx_to_pdf() {
-  # args: input_pptx output_pdf_dir
-  local input_pptx="$1"
-  local out_dir="$2"
-  mkdir -p "$out_dir"
+extract_source_id() {
+  # Reads nlm JSON output from stdin and prints source_id or id.
+  python3 - <<'PY'
+import sys, json
+data=json.load(sys.stdin)
 
-  # LibreOffice writes PDF into out_dir with same base name.
-  # Use a temp profile to avoid locking issues.
-  local tmp_profile
-  tmp_profile="$(mktemp -d)"
-  # shellcheck disable=SC2064
-  trap "rm -rf '$tmp_profile'" RETURN
+def pick(d):
+  if isinstance(d, dict):
+    for k in ("source_id","id"):
+      if k in d and d[k]:
+        return str(d[k])
+    for k in ("source","item","data","result"):
+      v=d.get(k)
+      r=pick(v)
+      if r:
+        return r
+  return ""
 
-  if soffice --headless --nologo --nodefault --nofirststartwizard \
-    -env:UserInstallation="file://${tmp_profile}" \
-    --convert-to pdf --outdir "$out_dir" "$input_pptx" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  # Fallback: some systems use libreoffice binary name.
-  if command -v libreoffice >/dev/null 2>&1; then
-    if libreoffice --headless --nologo --nodefault --nofirststartwizard \
-      -env:UserInstallation="file://${tmp_profile}" \
-      --convert-to pdf --outdir "$out_dir" "$input_pptx" >/dev/null 2>&1; then
-      return 0
-    fi
-  fi
-
-  return 1
+print(pick(data))
+PY
 }
 
 process_one() {
-  # args: txt_path
   local txt_path="$1"
   local deck_name
-  deck_name="$(safe_filename "$txt_path")"
+  deck_name="$(safe_basename_noext "$txt_path")"
 
   local pptx_path="${OUT_PPTX_DIR}/${deck_name}.pptx"
   local pdf_path="${OUT_PDF_DIR}/${deck_name}.pdf"
-
   local rel
   rel="${txt_path#${SRC_REPO_DIR}/}"
 
@@ -227,11 +187,10 @@ process_one() {
   fi
 
   log "Processing: $deck_name"
+
   local source_id=""
-  local ok="false"
   local msg=""
 
-  # Always best-effort cleanup source if we managed to create it.
   cleanup() {
     if [ -n "${source_id}" ]; then
       log "Cleanup: deleting source ${source_id}"
@@ -240,37 +199,13 @@ process_one() {
   }
   trap cleanup RETURN
 
-  # a) source add
-  log "Adding source to notebook..."
-  # Expect JSON output with an id; tolerate different shapes.
-  if ! source_id="$(
-    nlm source add "$NLM_NOTEBOOK_ALIAS" --file "$txt_path" --wait --json 2>/dev/null \
-      | python3 - <<'PY'
-import sys, json
-data=json.load(sys.stdin)
-# Try common patterns
-for key in ("source_id","id"):
-  if isinstance(data, dict) and key in data:
-    print(data[key]); sys.exit(0)
-# Maybe nested
-if isinstance(data, dict):
-  for k in ("source","item","data","result"):
-    v=data.get(k)
-    if isinstance(v, dict):
-      for key in ("source_id","id"):
-        if key in v:
-          print(v[key]); sys.exit(0)
-print("")
-PY
-  )"; then
-    msg="source add failed"
-    err "$msg: $deck_name"
-    append_manifest "$rel" "$deck_name" "fail" "$pptx_path" "$pdf_path" "$msg"
-    return 0
-  fi
+  log "Adding source..."
+  source_id="$(
+    nlm source add "$NLM_NOTEBOOK_ALIAS" --file "$txt_path" --wait --json 2>/dev/null | extract_source_id
+  )" || source_id=""
 
   if [ -z "$source_id" ]; then
-    msg="source id parse failed"
+    msg="source add failed / source id parse failed"
     err "$msg: $deck_name"
     append_manifest "$rel" "$deck_name" "fail" "$pptx_path" "$pdf_path" "$msg"
     return 0
@@ -278,8 +213,7 @@ PY
 
   log "Source added. source_id=$source_id"
 
-  # b) create slide deck
-  log "Creating slide deck in Studio..."
+  log "Creating slide deck..."
   local prompt
   prompt="$(german_prompt)"
   if ! nlm studio create "$NLM_NOTEBOOK_ALIAS" --type slide-deck --prompt "$prompt" --confirm >/dev/null 2>&1; then
@@ -289,7 +223,6 @@ PY
     return 0
   fi
 
-  # c) download pptx
   log "Downloading PPTX..."
   mkdir -p "$OUT_PPTX_DIR"
   if ! nlm download slide-deck "$NLM_NOTEBOOK_ALIAS" --format pptx --output "$pptx_path" >/dev/null 2>&1; then
@@ -299,27 +232,15 @@ PY
     return 0
   fi
 
-  # d) pptx -> pdf
-  log "Converting PPTX to PDF..."
+  log "Downloading PDF..."
   mkdir -p "$OUT_PDF_DIR"
-  if pptx_to_pdf "$pptx_path" "$OUT_PDF_DIR"; then
-    if [ ! -f "$pdf_path" ]; then
-      # LibreOffice should create it; if not, treat as failure but keep pptx.
-      msg="pdf convert produced no output"
-      warn "$msg: $deck_name"
-      append_manifest "$rel" "$deck_name" "partial" "$pptx_path" "$pdf_path" "$msg"
-      ok="true"
-      return 0
-    fi
-  else
-    msg="pdf conversion failed (pptx kept)"
+  if ! nlm download slide-deck "$NLM_NOTEBOOK_ALIAS" --format pdf --output "$pdf_path" >/dev/null 2>&1; then
+    msg="pdf download failed (pptx kept)"
     warn "$msg: $deck_name"
     append_manifest "$rel" "$deck_name" "partial" "$pptx_path" "$pdf_path" "$msg"
-    ok="true"
     return 0
   fi
 
-  ok="true"
   append_manifest "$rel" "$deck_name" "success" "$pptx_path" "$pdf_path" "ok"
   log "DONE: $deck_name"
   return 0
@@ -333,8 +254,6 @@ main() {
   ensure_deckfactory_notebook
 
   log "Scanning for TXT transcripts..."
-  # Find only *.txt (no SRT); stable order.
-  # shellcheck disable=SC2016
   mapfile -t files < <(find "$SRC_TRANSCRIPTS_DIR" -type f -name '*.txt' -print | LC_ALL=C sort)
 
   if [ "${#files[@]}" -eq 0 ]; then
@@ -351,9 +270,8 @@ main() {
       break
     fi
 
-    # Skip if already built (idempotent)
     local name pptx_path pdf_path
-    name="$(safe_filename "$f")"
+    name="$(safe_basename_noext "$f")"
     pptx_path="${OUT_PPTX_DIR}/${name}.pptx"
     pdf_path="${OUT_PDF_DIR}/${name}.pdf"
     if [ -f "$pptx_path" ] && [ -f "$pdf_path" ]; then
@@ -366,7 +284,7 @@ main() {
     count=$((count + 1))
   done
 
-  log "Run complete. Processed (attempted) $count transcript(s)."
+  log "Run complete. Attempted $count transcript(s)."
   log "Outputs: $OUT_PPTX_DIR/, $OUT_PDF_DIR/"
   log "Manifest: $MANIFEST_PATH"
 }
