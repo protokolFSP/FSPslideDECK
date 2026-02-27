@@ -25,17 +25,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Ensure Python + pip available (macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 --version
+          python3 -m pip --version || true
 
       - name: Install notebooklm-mcp-cli
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install notebooklm-mcp-cli
+          python3 -m pip install --upgrade pip
+          python3 -m pip install notebooklm-mcp-cli
           nlm --help >/dev/null
 
       - name: Generate decks (PPTX + PDF)
@@ -80,7 +82,6 @@ jobs:
 
           pushd "$ARCH_DIR" >/dev/null
           git add -A
-
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
@@ -99,4 +100,4 @@ jobs:
           access-key: ${{ secrets.IA_ACCESS_KEY }}
           secret-key: ${{ secrets.IA_SECRET_KEY }}
           identifier: FSPslide
-          files: decks_pdf
+          files: "decks_pdf/*.pdf"
