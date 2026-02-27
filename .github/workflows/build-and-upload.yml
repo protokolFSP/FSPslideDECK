@@ -1,103 +1,269 @@
-name: Build decks and upload PDFs to Archive.org
+#!/usr/bin/env bash
+set -euo pipefail
 
-on:
-  workflow_dispatch:
-    inputs:
-      max_per_run:
-        description: "Maximum transcripts to process this run"
-        required: false
-        default: "15"
-  schedule:
-    - cron: "17 2 * * *" # daily 02:17 UTC
+MAX_PER_RUN="${MAX_PER_RUN:-15}"
+TRANSCRIPT_REPO="${TRANSCRIPT_REPO:-https://github.com/protokolFSP/FSPtranskript}"
+TRANSCRIPT_DIR="${TRANSCRIPT_DIR:-transcripts}"
+WORK_DIR="${WORK_DIR:-work}"
+OUT_PPTX_DIR="${OUT_PPTX_DIR:-decks}"
+OUT_PDF_DIR="${OUT_PDF_DIR:-decks_pdf}"
+MANIFEST_PATH="${MANIFEST_PATH:-manifest/manifest.csv}"
+NLM_NOTEBOOK_ALIAS="${NLM_NOTEBOOK_ALIAS:-deckfactory}"
+NLM_NOTEBOOK_NAME="${NLM_NOTEBOOK_NAME:-Deck Factory}"
 
-jobs:
-  build-and-upload:
-    runs-on: self-hosted
-    permissions:
-      contents: write
+SRC_REPO_DIR="${WORK_DIR}/FSPtranskript"
+SRC_TRANSCRIPTS_DIR="${SRC_REPO_DIR}/${TRANSCRIPT_DIR}"
 
-    env:
-      MAX_PER_RUN: ${{ github.event.inputs.max_per_run || '15' }}
+log() { printf '%s %s\n' "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')]" "$*"; }
+warn() { printf '%s %s\n' "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')]" "WARN: $*" >&2; }
+err() { printf '%s %s\n' "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')]" "ERROR: $*" >&2; }
 
-    steps:
-      - name: Checkout main
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+ensure_dirs() {
+  mkdir -p "$WORK_DIR" "$OUT_PPTX_DIR" "$OUT_PDF_DIR"
+  mkdir -p "$(dirname "$MANIFEST_PATH")"
+  if [ ! -f "$MANIFEST_PATH" ]; then
+    printf 'timestamp_utc,transcript_relpath,deck_name,status,pptx_path,pdf_path,message\n' > "$MANIFEST_PATH"
+  fi
+}
 
-      - name: Ensure Python + pip available (macOS)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 --version
-          python3 -m pip --version || true
+append_manifest() {
+  local ts rel name status pptx pdf msg
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  rel="$1"; name="$2"; status="$3"; pptx="$4"; pdf="$5"; msg="$6"
+  msg="${msg//\"/\"\"}"
+  printf '%s,"%s","%s","%s","%s","%s","%s"\n' "$ts" "$rel" "$name" "$status" "$pptx" "$pdf" "$msg" >> "$MANIFEST_PATH"
+}
 
-      - name: Install notebooklm-mcp-cli
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install notebooklm-mcp-cli
-          nlm --help >/dev/null
+check_dependencies() {
+  command -v nlm >/dev/null 2>&1 || { err "nlm not found (workflow installs it)."; exit 1; }
+  command -v git >/dev/null 2>&1 || { err "git not found."; exit 1; }
+  command -v python3 >/dev/null 2>&1 || { err "python3 not found."; exit 1; }
+}
 
-      - name: Generate decks (PPTX + PDF)
-        shell: bash
-        run: |
-          set -euo pipefail
-          chmod +x scripts/generate_decks.sh
-          scripts/generate_decks.sh
+clone_or_pull_transcripts() {
+  if [ -d "$SRC_REPO_DIR/.git" ]; then
+    log "Updating transcripts repo: $SRC_REPO_DIR"
+    git -C "$SRC_REPO_DIR" fetch --all --prune
+    git -C "$SRC_REPO_DIR" reset --hard origin/HEAD
+  else
+    log "Cloning transcripts repo into: $SRC_REPO_DIR"
+    rm -rf "$SRC_REPO_DIR"
+    git clone --depth 1 "$TRANSCRIPT_REPO" "$SRC_REPO_DIR"
+  fi
 
-      - name: Publish outputs to deck-archive branch (git worktree)
-        shell: bash
-        run: |
-          set -euo pipefail
+  if [ ! -d "$SRC_TRANSCRIPTS_DIR" ]; then
+    err "Transcripts directory not found: $SRC_TRANSCRIPTS_DIR"
+    exit 1
+  fi
+}
 
-          BRANCH="deck-archive"
-          ARCH_DIR=".worktree-deck-archive"
+nlm_login_check() {
+  log "Checking NotebookLM login state..."
+  if ! nlm login --check >/dev/null 2>&1; then
+    err "NotebookLM login missing. Run 'nlm login' once on the runner machine (same user)."
+    exit 2
+  fi
+  log "NotebookLM login OK."
+}
 
-          rm -rf "$ARCH_DIR" || true
-          git fetch origin || true
+ensure_deckfactory_notebook() {
+  log "Ensuring notebook exists (alias: $NLM_NOTEBOOK_ALIAS, name: $NLM_NOTEBOOK_NAME)"
+  local exists
+  exists="$(nlm notebook list --json 2>/dev/null | python3 - <<PY
+import sys, json
+data=json.load(sys.stdin)
+alias="${NLM_NOTEBOOK_ALIAS}"
+items=data if isinstance(data, list) else (data.get("items") or data.get("notebooks") or [])
+print("yes" if any((it.get("alias") or "")==alias for it in items if isinstance(it, dict)) else "no")
+PY
+)" || exists="no"
 
-          if git show-ref --verify --quiet "refs/remotes/origin/$BRANCH"; then
-            git worktree add "$ARCH_DIR" "$BRANCH"
-          else
-            git worktree add --detach "$ARCH_DIR"
-            pushd "$ARCH_DIR" >/dev/null
-            git checkout --orphan "$BRANCH"
-            git rm -rf . >/dev/null 2>&1 || true
-            popd >/dev/null
-          fi
+  if [ "$exists" = "yes" ]; then
+    log "Notebook alias '$NLM_NOTEBOOK_ALIAS' already exists."
+    return 0
+  fi
 
-          mkdir -p "$ARCH_DIR/decks" "$ARCH_DIR/decks_pdf" "$ARCH_DIR/manifest"
+  log "Creating notebook '$NLM_NOTEBOOK_NAME' with alias '$NLM_NOTEBOOK_ALIAS'..."
+  nlm notebook create --name "$NLM_NOTEBOOK_NAME" --alias "$NLM_NOTEBOOK_ALIAS" --confirm >/dev/null
+  log "Notebook created."
+}
 
-          if command -v rsync >/dev/null 2>&1; then
-            rsync -a "decks/" "$ARCH_DIR/decks/" || true
-            rsync -a "decks_pdf/" "$ARCH_DIR/decks_pdf/" || true
-            rsync -a "manifest/" "$ARCH_DIR/manifest/" || true
-          else
-            cp -R "decks/." "$ARCH_DIR/decks/" || true
-            cp -R "decks_pdf/." "$ARCH_DIR/decks_pdf/" || true
-            cp -R "manifest/." "$ARCH_DIR/manifest/" || true
-          fi
+german_prompt() {
+  cat <<'PROMPT'
+Erstelle ein Slide-Deck auf Deutsch basierend AUSSCHLIESSLICH auf dem bereitgestellten Transkript.
 
-          pushd "$ARCH_DIR" >/dev/null
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git commit -m "Archive decks: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push -u origin "$BRANCH"
-          fi
-          popd >/dev/null
+Vorgaben:
+- Sprache: Deutsch
+- Umfang: 10–12 Folien
+- Zielgruppe: Management / Fachpublikum
+- Stil: klar, prägnant, entscheidungsorientiert
+- Jede Folie: Titel + 3–5 Bulletpoints, max. 12 Wörter pro Bulletpoint
+- Zahlen, Eigennamen und Datumsangaben: exakt übernehmen
+- Keine erfundenen Fakten, keine klinischen/realen Details hinzufügen, die nicht im Transkript stehen
+- Wenn der Sprecher unklar ist: “Sprecher 1”, “Sprecher 2” verwenden
+- Unklarheiten oder Widersprüche explizit markieren als: “Unklar/Widerspruch: …”
 
-          git worktree remove "$ARCH_DIR" --force
+Empfohlene Struktur:
+1) Titel / Kontext
+2) Agenda
+3) Leitsymptome / Verlauf (falls vorhanden)
+4) Kernthemen (2–4 Folien)
+5) Entscheidungen / Beschlüsse
+6) Risiken / offene Fragen
+7) Empfehlungen
+8) Nächste Schritte (Checkliste)
 
-      - name: Upload PDFs to Archive.org (FSPslide)
-        uses: Nick2bad4u/internet-archive-upload@v1.6
-        with:
-          access-key: ${{ secrets.IA_ACCESS_KEY }}
-          secret-key: ${{ secrets.IA_SECRET_KEY }}
-          identifier: FSPslide
-          files: "decks_pdf/*.pdf"
+Letzte Folie: “Nächste Schritte” als Checkliste mit:
+- To-do
+- Owner/Rolle
+- Deadline (wenn nicht im Transkript: “TBD”)
+PROMPT
+}
+
+safe_basename_noext() {
+  local p="$1"
+  local b
+  b="$(basename "$p")"
+  printf '%s' "${b%.txt}"
+}
+
+extract_source_id() {
+  python3 - <<'PY'
+import sys, json
+data=json.load(sys.stdin)
+
+def pick(d):
+  if isinstance(d, dict):
+    for k in ("source_id","id"):
+      if k in d and d[k]:
+        return str(d[k])
+    for k in ("source","item","data","result"):
+      v=d.get(k)
+      r=pick(v)
+      if r:
+        return r
+  return ""
+
+print(pick(data))
+PY
+}
+
+process_one() {
+  local txt_path="$1"
+  local deck_name
+  deck_name="$(safe_basename_noext "$txt_path")"
+
+  local pptx_path="${OUT_PPTX_DIR}/${deck_name}.pptx"
+  local pdf_path="${OUT_PDF_DIR}/${deck_name}.pdf"
+  local rel
+  rel="${txt_path#${SRC_REPO_DIR}/}"
+
+  if [ -f "$pptx_path" ] && [ -f "$pdf_path" ]; then
+    log "SKIP (already exists): $deck_name"
+    append_manifest "$rel" "$deck_name" "skipped" "$pptx_path" "$pdf_path" "already exists"
+    return 0
+  fi
+
+  log "Processing: $deck_name"
+
+  local source_id=""
+  local msg=""
+
+  cleanup() {
+    if [ -n "${source_id}" ]; then
+      log "Cleanup: deleting source ${source_id}"
+      nlm source delete "$source_id" "$NLM_NOTEBOOK_ALIAS" --confirm >/dev/null 2>&1 || true
+    fi
+  }
+  trap cleanup RETURN
+
+  log "Adding source..."
+  source_id="$(
+    nlm source add "$NLM_NOTEBOOK_ALIAS" --file "$txt_path" --wait --json 2>/dev/null | extract_source_id
+  )" || source_id=""
+
+  if [ -z "$source_id" ]; then
+    msg="source add failed / source id parse failed"
+    err "$msg: $deck_name"
+    append_manifest "$rel" "$deck_name" "fail" "$pptx_path" "$pdf_path" "$msg"
+    return 0
+  fi
+
+  log "Source added. source_id=$source_id"
+
+  log "Creating slide deck..."
+  local prompt
+  prompt="$(german_prompt)"
+  if ! nlm studio create "$NLM_NOTEBOOK_ALIAS" --type slide-deck --prompt "$prompt" --confirm >/dev/null 2>&1; then
+    msg="studio create failed"
+    err "$msg: $deck_name"
+    append_manifest "$rel" "$deck_name" "fail" "$pptx_path" "$pdf_path" "$msg"
+    return 0
+  fi
+
+  log "Downloading PPTX..."
+  mkdir -p "$OUT_PPTX_DIR"
+  if ! nlm download slide-deck "$NLM_NOTEBOOK_ALIAS" --format pptx --output "$pptx_path" >/dev/null 2>&1; then
+    msg="pptx download failed"
+    err "$msg: $deck_name"
+    append_manifest "$rel" "$deck_name" "fail" "$pptx_path" "$pdf_path" "$msg"
+    return 0
+  fi
+
+  log "Downloading PDF..."
+  mkdir -p "$OUT_PDF_DIR"
+  if ! nlm download slide-deck "$NLM_NOTEBOOK_ALIAS" --format pdf --output "$pdf_path" >/dev/null 2>&1; then
+    msg="pdf download failed (pptx kept)"
+    warn "$msg: $deck_name"
+    append_manifest "$rel" "$deck_name" "partial" "$pptx_path" "$pdf_path" "$msg"
+    return 0
+  fi
+
+  append_manifest "$rel" "$deck_name" "success" "$pptx_path" "$pdf_path" "ok"
+  log "DONE: $deck_name"
+}
+
+main() {
+  check_dependencies
+  ensure_dirs
+  clone_or_pull_transcripts
+  nlm_login_check
+  ensure_deckfactory_notebook
+
+  log "Scanning for TXT transcripts..."
+  mapfile -t files < <(find "$SRC_TRANSCRIPTS_DIR" -type f -name '*.txt' -print | LC_ALL=C sort)
+
+  if [ "${#files[@]}" -eq 0 ]; then
+    log "No .txt files found under: $SRC_TRANSCRIPTS_DIR"
+    exit 0
+  fi
+
+  log "Found ${#files[@]} transcript(s). MAX_PER_RUN=$MAX_PER_RUN"
+  local count=0
+
+  for f in "${files[@]}"; do
+    if [ "$count" -ge "$MAX_PER_RUN" ]; then
+      log "Reached MAX_PER_RUN=$MAX_PER_RUN. Exiting."
+      break
+    fi
+
+    local name pptx_path pdf_path
+    name="$(safe_basename_noext "$f")"
+    pptx_path="${OUT_PPTX_DIR}/${name}.pptx"
+    pdf_path="${OUT_PDF_DIR}/${name}.pdf"
+    if [ -f "$pptx_path" ] && [ -f "$pdf_path" ]; then
+      log "SKIP (already exists): $name"
+      append_manifest "${f#${SRC_REPO_DIR}/}" "$name" "skipped" "$pptx_path" "$pdf_path" "already exists"
+      continue
+    fi
+
+    process_one "$f" || true
+    count=$((count + 1))
+  done
+
+  log "Run complete. Attempted $count transcript(s)."
+  log "Outputs: $OUT_PPTX_DIR/, $OUT_PDF_DIR/"
+  log "Manifest: $MANIFEST_PATH"
+}
+
+main "$@"
